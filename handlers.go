@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+	"database/sql"
 
+	"github.com/gorilla/mux"
 	"github.com/patrickmn/go-cache"
 	"github.com/vincent-petithory/dataurl"
 	"go.mau.fi/whatsmeow"
@@ -28,6 +31,17 @@ func (v Values) Get(key string) string {
 }
 
 var messageTypes = []string{"Message", "ReadReceipt", "Presence", "HistorySync", "ChatPresence", "All"}
+
+func (s *server) authadmin(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        token := r.Header.Get("Authorization")
+        if token != *adminToken {
+			s.Respond(w, r, http.StatusUnauthorized, errors.New("Unauthorized"))
+            return
+        }
+        next.ServeHTTP(w, r)
+    })
+}
 
 func (s *server) authalice(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -455,6 +469,62 @@ func (s *server) Logout() http.HandlerFunc {
 	}
 }
 
+// Pair by Phone. Retrieves the code to pair by phone number instead of QR
+func (s *server) PairPhone() http.HandlerFunc {
+
+	type pairStruct struct {
+		Phone       string
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+		userid, _ := strconv.Atoi(txtid)
+
+		if clientPointer[userid] == nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("No session"))
+			return
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		var t pairStruct
+		err := decoder.Decode(&t)
+		if err != nil {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("Could not decode Payload"))
+			return
+		}
+
+		if t.Phone == "" {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("Missing Phone in Payload"))
+			return
+		}
+
+		isLoggedIn := clientPointer[userid].IsLoggedIn()
+		if(isLoggedIn) {
+			log.Error().Msg(fmt.Sprintf("%s", "Already paired"))
+			s.Respond(w, r, http.StatusBadRequest, errors.New("Already paired"))
+			return
+		}
+
+		linkingCode, err := clientPointer[userid].PairPhone(t.Phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+		if err != nil {
+			log.Error().Msg(fmt.Sprintf("%s", err))
+			s.Respond(w, r, http.StatusBadRequest, err)
+			return
+		}
+
+		response := map[string]interface{}{"LinkingCode": linkingCode}
+		responseJson, err := json.Marshal(response)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, err)
+		} else {
+			s.Respond(w, r, http.StatusOK, string(responseJson))
+		}
+		return
+	}
+}
+
+
 // Gets Connected and LoggedIn Status
 func (s *server) GetStatus() http.HandlerFunc {
 
@@ -486,6 +556,7 @@ func (s *server) GetStatus() http.HandlerFunc {
 func (s *server) SendDocument() http.HandlerFunc {
 
 	type documentStruct struct {
+		Caption     string
 		Phone       string
 		Document    string
 		FileName    string
@@ -571,6 +642,7 @@ func (s *server) SendDocument() http.HandlerFunc {
 			FileEncSha256: uploaded.FileEncSHA256,
 			FileSha256:    uploaded.FileSHA256,
 			FileLength:    proto.Uint64(uint64(len(filedata))),
+			Caption:       proto.String(t.Caption),
 		}}
 
 		if t.ContextInfo.StanzaId != nil {
@@ -581,7 +653,7 @@ func (s *server) SendDocument() http.HandlerFunc {
 			}
 		}
 
-		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg)
+		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
 			return
@@ -697,7 +769,7 @@ func (s *server) SendAudio() http.HandlerFunc {
 			}
 		}
 
-		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg)
+		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
 			return
@@ -809,7 +881,7 @@ func (s *server) SendImage() http.HandlerFunc {
 			}
 		}
 
-		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg)
+		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
 			return
@@ -921,7 +993,7 @@ func (s *server) SendSticker() http.HandlerFunc {
 			}
 		}
 
-		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg)
+		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
 			return
@@ -1035,7 +1107,7 @@ func (s *server) SendVideo() http.HandlerFunc {
 			}
 		}
 
-		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg)
+		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
 			return
@@ -1123,7 +1195,7 @@ func (s *server) SendContact() http.HandlerFunc {
 			}
 		}
 
-		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg)
+		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
 			return
@@ -1213,7 +1285,7 @@ func (s *server) SendLocation() http.HandlerFunc {
 			}
 		}
 
-		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg)
+		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
 			return
@@ -1315,11 +1387,11 @@ func (s *server) SendButtons() http.HandlerFunc {
             Buttons:     buttons,
         }
 
-        resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, &waProto.Message{ViewOnceMessage: &waProto.FutureProofMessage{
+		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, &waProto.Message{ViewOnceMessage: &waProto.FutureProofMessage{
             Message: &waProto.Message{
                 ButtonsMessage: msg2,
             },
-        }})
+        }}, whatsmeow.SendRequestExtra{ID: msgid})
         if err != nil {
             s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
             return
@@ -1455,20 +1527,20 @@ func (s *server) SendList() http.HandlerFunc {
             FooterText:  proto.String(t.FooterText),
         }
 
-        resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, &waProto.Message{
+		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, &waProto.Message{
             ViewOnceMessage: &waProto.FutureProofMessage{
                 Message: &waProto.Message{
                     ListMessage: msg1,
                 },
-            }})
+            }}, whatsmeow.SendRequestExtra{ID: msgid})
         if err != nil {
             s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
             return
         }
 
         log.Info().Str("timestamp", fmt.Sprintf("%d", resp.Timestamp)).Str("id", msgid).Msg("Message sent")
-        response := map[string]interface{}{"Details": "Sent", "Timestamp": resp.Timestamp, "Id": msgid}
-        responseJson, err := json.Marshal(response)
+		response := map[string]interface{}{"Details": "Sent", "Timestamp": resp.Timestamp, "Id": msgid}
+		responseJson, err := json.Marshal(response)
         if err != nil {
             s.Respond(w, r, http.StatusInternalServerError, err)
         } else {
@@ -1548,7 +1620,7 @@ func (s *server) SendMessage() http.HandlerFunc {
 			}
 		}
 
-		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg)
+		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
 			return
@@ -1708,7 +1780,7 @@ func (s *server) SendTemplate() http.HandlerFunc {
 		},
 		}
 
-		resp, err = clientPointer[userid].SendMessage(context.Background(),recipient, msg)
+		resp, err = clientPointer[userid].SendMessage(context.Background(),recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
 			return
@@ -1829,8 +1901,8 @@ func (s *server) GetUser() http.HandlerFunc {
 
 		var jids []types.JID
 		for _, arg := range t.Phone {
-			jid, ok := parseJID(arg)
-			if !ok {
+			jid, err := types.ParseJID(arg)
+			if err != nil {
 				return
 			}
 			jids = append(jids, jid)
@@ -2047,7 +2119,7 @@ func (s *server) DownloadImage() http.HandlerFunc {
 		}
 
 		// check/creates user directory for files
-		userDirectory := fmt.Sprintf("%s/files/user_%s", s.exPath, txtid)
+		userDirectory := filepath.Join(s.exPath, "files", "user_"+txtid)
 		_, err := os.Stat(userDirectory)
 		if os.IsNotExist(err) {
 			errDir := os.MkdirAll(userDirectory, 0751)
@@ -2127,7 +2199,7 @@ func (s *server) DownloadDocument() http.HandlerFunc {
 		}
 
 		// check/creates user directory for files
-		userDirectory := fmt.Sprintf("%s/files/user_%s", s.exPath, txtid)
+		userDirectory := filepath.Join(s.exPath, "files", "user_"+txtid)
 		_, err := os.Stat(userDirectory)
 		if os.IsNotExist(err) {
 			errDir := os.MkdirAll(userDirectory, 0751)
@@ -2207,7 +2279,7 @@ func (s *server) DownloadVideo() http.HandlerFunc {
 		}
 
 		// check/creates user directory for files
-		userDirectory := fmt.Sprintf("%s/files/user_%s", s.exPath, txtid)
+		userDirectory := filepath.Join(s.exPath, "files", "user_"+txtid)
 		_, err := os.Stat(userDirectory)
 		if os.IsNotExist(err) {
 			errDir := os.MkdirAll(userDirectory, 0751)
@@ -2287,7 +2359,7 @@ func (s *server) DownloadAudio() http.HandlerFunc {
 		}
 
 		// check/creates user directory for files
-		userDirectory := fmt.Sprintf("%s/files/user_%s", s.exPath, txtid)
+		userDirectory := filepath.Join(s.exPath, "files", "user_"+txtid)
 		_, err := os.Stat(userDirectory)
 		if os.IsNotExist(err) {
 			errDir := os.MkdirAll(userDirectory, 0751)
@@ -2417,7 +2489,7 @@ func (s *server) React() http.HandlerFunc {
 			},
 		}
 
-		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg)
+		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
 			return
@@ -2771,6 +2843,172 @@ func (s *server) SetGroupName() http.HandlerFunc {
 	}
 }
 
+// Admin List users
+func (s *server) ListUsers() http.HandlerFunc {
+
+	type usersStruct struct {
+		Id int
+        Name string
+        Connected bool
+        Events string
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+        // Query the database to get the list of users
+        rows, err := s.db.Query("SELECT id, name, token, webhook, jid, connected, expiration, events FROM users")
+        if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("Problem accessing DB"))
+            return
+        }
+        defer rows.Close()
+
+        // Create a slice to store the user data
+        users := []map[string]interface{}{}
+
+        // Iterate over the rows and populate the user data
+        for rows.Next() {
+            var id int
+            var name, token, webhook, jid string
+            var connectedNull sql.NullInt64
+            var expiration int
+            var events string
+
+            err := rows.Scan(&id, &name, &token, &webhook, &jid, &connectedNull, &expiration, &events)
+            if err != nil {
+			    s.Respond(w, r, http.StatusInternalServerError, errors.New("Problem accessing DB"))
+                return
+            }
+
+            connected := int(0)
+            if connectedNull.Valid {
+                connected = int(connectedNull.Int64)
+            }
+
+            user := map[string]interface{}{
+                "id":         id,
+                "name":       name,
+                "token":      token,
+                "webhook":    webhook,
+                "jid":        jid,
+                "connected":  connected == 1,
+                "expiration": expiration,
+                "events":     events,
+            }
+
+            users = append(users, user)
+        }
+        // Check for any error that occurred during iteration
+        if err := rows.Err(); err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("Problem accessing DB"))
+            return
+        }
+
+        // Set the response content type to JSON
+        w.Header().Set("Content-Type", "application/json")
+
+        // Encode the user data as JSON and write the response
+        err = json.NewEncoder(w).Encode(users)
+        if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("Problem encodingJSON"))
+            return
+        }
+    }
+}
+
+func (s *server) AddUser() http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+
+        // Parse the request body
+        var user struct {
+            Name       string `json:"name"`
+            Token      string `json:"token"`
+            Webhook    string `json:"webhook"`
+            Expiration int    `json:"expiration"`
+            Events     string `json:"events"`
+        }
+        err := json.NewDecoder(r.Body).Decode(&user)
+        if err != nil {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("Incomplete data in Payload. Required name,token,webhook,expiration,events"))
+            return
+        }
+
+		// Check if a user with the same token already exists
+		var count int
+		err = s.db.QueryRow("SELECT COUNT(*) FROM users WHERE token = ?", user.Token).Scan(&count)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("Problem accessing DB"))
+			return
+		}
+		if count > 0 {
+			s.Respond(w, r, http.StatusConflict, errors.New("User with the same token already exists"))
+			return
+		}
+
+		// Validate the events input
+		validEvents := []string{"Message", "ReadReceipt", "Presence", "HistorySync", "ChatPresence", "All"}
+		eventList := strings.Split(user.Events, ",")
+		for _, event := range eventList {
+			event = strings.TrimSpace(event)
+			if !contains(validEvents, event) {
+				s.Respond(w, r, http.StatusBadRequest, errors.New("Invalid event: "+event))
+				return
+			}
+		}
+
+        // Insert the user into the database
+        result, err := s.db.Exec("INSERT INTO users (name, token, webhook, expiration, events, jid, qrcode) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            user.Name, user.Token, user.Webhook, user.Expiration, user.Events, "", "")
+        if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("Problem accessing DB"))
+			log.Error().Str("error", fmt.Sprintf("%v", err)).Msg("Admin DB Error")
+            return
+        }
+
+        // Get the ID of the inserted user
+        id, _ := result.LastInsertId()
+
+        // Return the inserted user ID
+		response := map[string]interface{}{
+            "id": id,
+        }
+        json.NewEncoder(w).Encode(response)
+    }
+}
+
+func (s *server) DeleteUser() http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+
+        // Get the user ID from the request URL
+        vars := mux.Vars(r)
+        userID := vars["id"]
+
+        // Delete the user from the database
+        result, err := s.db.Exec("DELETE FROM users WHERE id = ?", userID)
+        if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("Problem accessing DB"))
+            return
+        }
+
+        // Check if the user was deleted
+        rowsAffected, _ := result.RowsAffected()
+        if rowsAffected == 0 {
+			s.Respond(w, r, http.StatusNotFound, errors.New("User not found"))
+            return
+        }
+
+        // Return a success response
+		response := map[string]interface{}{"Details": "User deleted successfully"}
+		responseJson, err := json.Marshal(response)
+
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, err)
+		} else {
+			s.Respond(w, r, http.StatusOK, string(responseJson))
+		}
+    }
+}
+
 // Writes JSON response to API clients
 func (s *server) Respond(w http.ResponseWriter, r *http.Request, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -2816,4 +3054,13 @@ func validateMessageFields(phone string, stanzaid *string, participant *string) 
 	}
 
 	return recipient, nil
+}
+
+func contains(slice []string, item string) bool {
+    for _, value := range slice {
+        if value == item {
+            return true
+        }
+    }
+    return false
 }
